@@ -1,0 +1,10 @@
+.swjc-price-list__section{margin-bottom:1.5rem}
+.swjc-price-list__title{margin:0 0 .75rem;color:var(--bs-body-color)}
+.swjc-price-list__table{width:100%;table-layout:fixed}
+.swjc-price-list__table td{vertical-align:top}
+.swjc-price-list__col1{width:85%}
+.swjc-price-list__col2{width:15%;text-align:right;white-space:nowrap;font-weight:700}
+.swjc-price-list__service{font-weight:700;color:var(--bs-body-color)}
+.swjc-price-list__note{opacity:.85}
+.table>:not(caption)>*>*{background-color:#f5f7fa}
+[data-bs-theme=dark] .table>:not(caption)>*>*{background-color:#0b1f3a}
