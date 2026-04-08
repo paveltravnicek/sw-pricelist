@@ -13,6 +13,23 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+require __DIR__ . '/plugin-update-checker/plugin-update-checker.php';
+
+use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
+
+$swUpdateChecker = PucFactory::buildUpdateChecker(
+	'https://github.com/paveltravnicek/sw-pricelist/',
+	__FILE__,
+	'sw-pricelist'
+);
+
+$swUpdateChecker->setBranch('main');
+$swUpdateChecker->getVcsApi()->enableReleaseAssets('/\.zip$/i');
+
 class SW_Jednoduche_Ceniky {
     const OPTION_KEY = 'sw_jednoduche_ceniky_data';
     const NONCE_KEY  = 'sw_jednoduche_ceniky_nonce';
