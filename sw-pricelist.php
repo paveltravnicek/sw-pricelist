@@ -5,7 +5,8 @@
  * Version: 1.0
  * Author: Smart Websites
  * Author URI: https://smart-websites.cz
- * Text Domain: sw-jednoduche-ceniky
+ * Update URI: https://github.com/paveltravnicek/sw-pricelist/
+ * Text Domain: sw-pricelist
  */
 
 if (!defined('ABSPATH')) {
