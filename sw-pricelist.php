@@ -7,14 +7,13 @@
  * Author URI: https://smart-websites.cz
  * Update URI: https://github.com/paveltravnicek/sw-pricelist/
  * Text Domain: sw-pricelist
+ * SW Plugin: yes
+ * SW Service Type: passive
+ * SW License Group: both
  */
 
 if (!defined('ABSPATH')) {
     exit;
-}
-
-if ( ! defined( 'ABSPATH' ) ) {
-	exit;
 }
 
 require __DIR__ . '/plugin-update-checker/plugin-update-checker.php';
@@ -30,18 +29,116 @@ $swUpdateChecker = PucFactory::buildUpdateChecker(
 $swUpdateChecker->setBranch('main');
 $swUpdateChecker->getVcsApi()->enableReleaseAssets('/\.zip$/i');
 
-class SW_Jednoduche_Ceniky {
+final class SW_Jednoduche_Ceniky {
     const OPTION_KEY = 'sw_jednoduche_ceniky_data';
     const NONCE_KEY  = 'sw_jednoduche_ceniky_nonce';
     const SLUG       = 'sw-jednoduche-ceniky';
+    const LICENSE_OPTION = 'swjc_license';
+    const LICENSE_CRON_HOOK = 'swjc_license_daily_check';
+    const HUB_BASE = 'https://smart-websites.cz';
+    const PLUGIN_SLUG = 'sw-pricelist';
 
     public function __construct() {
+        register_activation_hook(__FILE__, [$this, 'activate']);
+        register_deactivation_hook(__FILE__, [$this, 'deactivate']);
+
         add_action('admin_menu', [$this, 'admin_menu']);
         add_action('admin_enqueue_scripts', [$this, 'admin_assets']);
         add_action('admin_post_sw_jednoduche_ceniky_save', [$this, 'handle_save']);
         add_shortcode('sw_cenik', [$this, 'shortcode']);
         add_shortcode('levitas_cenik', [$this, 'shortcode']); // legacy alias
         add_filter('plugin_action_links_' . plugin_basename(__FILE__), [$this, 'add_settings_link']);
+        add_action(self::LICENSE_CRON_HOOK, [$this, 'cron_refresh_plugin_license']);
+
+        if (is_admin()) {
+            add_action('admin_post_swjc_verify_license', [$this, 'handle_verify_license']);
+            add_action('admin_post_swjc_remove_license', [$this, 'handle_remove_license']);
+            add_action('admin_init', [$this, 'maybe_refresh_plugin_license']);
+            add_action('admin_init', [$this, 'block_direct_deactivate']);
+        }
+    }
+
+
+    public function activate() {
+        if (!wp_next_scheduled(self::LICENSE_CRON_HOOK)) {
+            wp_schedule_event(time() + HOUR_IN_SECONDS, 'twicedaily', self::LICENSE_CRON_HOOK);
+        }
+    }
+
+    public function deactivate() {
+        $timestamp = wp_next_scheduled(self::LICENSE_CRON_HOOK);
+        if ($timestamp) {
+            wp_unschedule_event($timestamp, self::LICENSE_CRON_HOOK);
+        }
+    }
+
+    public function cron_refresh_plugin_license() {
+        $this->refresh_plugin_license('cron');
+    }
+
+    private function default_license_state(): array {
+        return [
+            'key' => '',
+            'status' => 'missing',
+            'type' => '',
+            'valid_to' => '',
+            'domain' => '',
+            'message' => '',
+            'last_check' => 0,
+            'last_success' => 0,
+        ];
+    }
+
+    private function get_license_state(): array {
+        $state = get_option(self::LICENSE_OPTION, []);
+        if (!is_array($state)) {
+            $state = [];
+        }
+        return wp_parse_args($state, $this->default_license_state());
+    }
+
+    private function update_license_state(array $data): void {
+        $current = $this->get_license_state();
+        $new = array_merge($current, $data);
+        $new['key'] = sanitize_text_field((string) ($new['key'] ?? ''));
+        $new['status'] = sanitize_key((string) ($new['status'] ?? 'missing'));
+        $new['type'] = sanitize_key((string) ($new['type'] ?? ''));
+        $new['valid_to'] = sanitize_text_field((string) ($new['valid_to'] ?? ''));
+        $new['domain'] = sanitize_text_field((string) ($new['domain'] ?? ''));
+        $new['message'] = sanitize_text_field((string) ($new['message'] ?? ''));
+        $new['last_check'] = (int) ($new['last_check'] ?? 0);
+        $new['last_success'] = (int) ($new['last_success'] ?? 0);
+        update_option(self::LICENSE_OPTION, $new, false);
+    }
+
+    private function get_management_context(): array {
+        $guard_present = function_exists('sw_guard_get_service_state');
+        $management_status = $guard_present ? (string) get_option('swg_management_status', 'NONE') : 'NONE';
+        $service_state = $guard_present ? (string) sw_guard_get_service_state(self::PLUGIN_SLUG) : 'off';
+        $guard_last_success = $guard_present ? (int) get_option('swg_last_success_ts', 0) : 0;
+        $connected_recently = $guard_last_success > 0 && (time() - $guard_last_success) <= (8 * DAY_IN_SECONDS);
+
+        return [
+            'guard_present' => $guard_present,
+            'management_status' => $management_status,
+            'service_state' => in_array($service_state, ['active', 'passive', 'off'], true) ? $service_state : 'off',
+            'guard_last_success' => $guard_last_success,
+            'connected_recently' => $connected_recently,
+            'is_active' => $guard_present && $connected_recently && $management_status === 'ACTIVE' && $service_state === 'active',
+        ];
+    }
+
+    private function has_active_standalone_license(): bool {
+        $license = $this->get_license_state();
+        return $license['key'] !== '' && $license['status'] === 'active' && $license['type'] === 'plugin_single';
+    }
+
+    private function plugin_is_operational(): bool {
+        $management = $this->get_management_context();
+        if ($management['is_active']) {
+            return true;
+        }
+        return $this->has_active_standalone_license();
     }
 
     public function add_settings_link($links) {
@@ -49,6 +146,12 @@ class SW_Jednoduche_Ceniky {
             $links,
             '<a href="' . esc_url(admin_url('admin.php?page=' . self::SLUG)) . '">' . esc_html__('Nastavení', 'sw-jednoduche-ceniky') . '</a>'
         );
+
+        $management = $this->get_management_context();
+        if ($management['is_active']) {
+            unset($links['deactivate']);
+        }
+
         return $links;
     }
 
@@ -193,6 +296,10 @@ class SW_Jednoduche_Ceniky {
         }
 
         $lists = $this->get_data();
+        $license = $this->get_license_state();
+        $management = $this->get_management_context();
+        $is_operational = $this->plugin_is_operational();
+        $status_payload = $this->get_license_panel_data($license, $management, $is_operational);
         ?>
         <div class="wrap swjc-wrap">
             <div class="swjc-hero">
@@ -209,20 +316,76 @@ class SW_Jednoduche_Ceniky {
                 </div>
             </div>
 
+            <?php if (!empty($_GET['swjc_license_message'])) : ?>
+                <div class="notice notice-success"><p><?php echo esc_html(sanitize_text_field((string) $_GET['swjc_license_message'])); ?></p></div>
+            <?php endif; ?>
+
+            <div class="swjc-card swjc-card--licence">
+                <div class="swjc-card__head">
+                    <div>
+                        <h2><?php echo esc_html__('Licence pluginu', 'sw-jednoduche-ceniky'); ?></h2>
+                        <p class="swjc-muted"><?php echo esc_html__('Plugin může běžet buď v rámci platné správy webu, nebo přes samostatnou licenci.', 'sw-jednoduche-ceniky'); ?></p>
+                    </div>
+                    <span class="swjc-licence-badge swjc-licence-badge--<?php echo esc_attr($status_payload['badge_class']); ?>"><?php echo esc_html($status_payload['badge_label']); ?></span>
+                </div>
+
+                <div class="swjc-licence-grid">
+                    <div class="swjc-licence-item">
+                        <span class="swjc-licence-label"><?php echo esc_html__('Režim', 'sw-jednoduche-ceniky'); ?></span>
+                        <strong><?php echo esc_html($status_payload['mode']); ?></strong>
+                        <?php if ($status_payload['subline']) : ?><span><?php echo esc_html($status_payload['subline']); ?></span><?php endif; ?>
+                    </div>
+                    <div class="swjc-licence-item">
+                        <span class="swjc-licence-label"><?php echo esc_html__('Platnost do', 'sw-jednoduche-ceniky'); ?></span>
+                        <strong><?php echo esc_html($status_payload['valid_to']); ?></strong>
+                        <?php if ($status_payload['domain']) : ?><span><?php echo esc_html($status_payload['domain']); ?></span><?php endif; ?>
+                    </div>
+                    <div class="swjc-licence-item">
+                        <span class="swjc-licence-label"><?php echo esc_html__('Poslední ověření', 'sw-jednoduche-ceniky'); ?></span>
+                        <strong><?php echo esc_html($status_payload['last_check']); ?></strong>
+                        <?php if ($status_payload['message']) : ?><span><?php echo esc_html($status_payload['message']); ?></span><?php endif; ?>
+                    </div>
+                </div>
+
+                <?php if (!$management['is_active']) : ?>
+                    <div class="swjc-license-form-wrap">
+                        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" class="swjc-license-form">
+                            <?php wp_nonce_field('swjc_verify_license'); ?>
+                            <input type="hidden" name="action" value="swjc_verify_license">
+                            <label for="swjc_license_key"><strong><?php echo esc_html__('Licenční kód pluginu', 'sw-jednoduche-ceniky'); ?></strong></label>
+                            <input type="text" id="swjc_license_key" name="license_key" value="<?php echo esc_attr($license['key']); ?>" class="regular-text" placeholder="SWLIC-..." />
+                            <p class="description"><?php echo esc_html__('Použijte pouze pro samostatnou licenci pluginu. Pokud máte Správu webu, kód vyplňovat nemusíte.', 'sw-jednoduche-ceniky'); ?></p>
+                            <div class="swjc-license-actions">
+                                <button type="submit" class="button button-primary"><?php echo esc_html__('Ověřit a uložit licenci', 'sw-jednoduche-ceniky'); ?></button>
+                                <?php if ($license['key'] !== '') : ?>
+                                    <a href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=swjc_remove_license'), 'swjc_remove_license')); ?>" class="button button-secondary"><?php echo esc_html__('Odebrat licenční kód', 'sw-jednoduche-ceniky'); ?></a>
+                                <?php endif; ?>
+                            </div>
+                        </form>
+                    </div>
+                <?php else : ?>
+                    <div class="swjc-note"><?php echo esc_html__('Plugin je provozován v rámci Správy webu. Samostatný licenční kód není potřeba.', 'sw-jednoduche-ceniky'); ?></div>
+                <?php endif; ?>
+            </div>
+
+            <?php if (!$is_operational) : ?>
+                <div class="notice notice-warning"><p><?php echo esc_html__('Plugin momentálně nemá platnou licenci. Nastavení zůstává pouze pro čtení a shortcode na webu nic nevypíše.', 'sw-jednoduche-ceniky'); ?></p></div>
+            <?php endif; ?>
+
             <?php if (isset($_GET['updated']) && $_GET['updated'] === '1') : ?>
                 <div class="notice notice-success is-dismissible"><p><?php echo esc_html__('Ceníky byly uloženy.', 'sw-jednoduche-ceniky'); ?></p></div>
             <?php endif; ?>
 
-            <div class="notice notice-info"><p><?php echo wp_kses_post(__('Použijte shortcode <code>[sw_cenik]</code> pro první ceník nebo <code>[sw_cenik key="1"]</code> či jiný klíč pro konkrétní ceník.', 'sw-jednoduche-ceniky')); ?></p></div>
-
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" id="swjc-form">
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" id="swjc-form" class="<?php echo $is_operational ? '' : 'is-readonly'; ?>">
                 <input type="hidden" name="action" value="sw_jednoduche_ceniky_save">
                 <?php wp_nonce_field(self::NONCE_KEY, '_wpnonce'); ?>
+                <fieldset <?php disabled(!$is_operational); ?>>
 
                 <div class="swjc-toolbar swjc-card">
                     <div>
                         <h2><?php echo esc_html__('Správa ceníků', 'sw-jednoduche-ceniky'); ?></h2>
                         <p class="swjc-muted"><?php echo esc_html__('Můžete vytvořit čistý ceník nebo duplikovat existující a upravit si jen jazyk, měnu nebo text před cenou.', 'sw-jednoduche-ceniky'); ?></p>
+                        <p class="swjc-muted swjc-toolbar__hint"><?php echo wp_kses_post(__('Použijte shortcode <code>[sw_cenik]</code> pro první ceník nebo <code>[sw_cenik key="1"]</code> či jiný klíč pro konkrétní ceník.', 'sw-jednoduche-ceniky')); ?></p>
                     </div>
                     <div class="swjc-toolbar__actions">
                         <button type="button" class="button button-secondary" id="swjc-add-list"><?php echo esc_html__('Přidat prázdný ceník', 'sw-jednoduche-ceniky'); ?></button>
@@ -244,6 +407,7 @@ class SW_Jednoduche_Ceniky {
                 </div>
 
                 <textarea name="swjc_payload" id="swjc-payload" class="swjc-hidden"></textarea>
+                </fieldset>
             </form>
         </div>
 
@@ -413,6 +577,11 @@ class SW_Jednoduche_Ceniky {
 
         check_admin_referer(self::NONCE_KEY);
 
+        if (!$this->plugin_is_operational()) {
+            wp_safe_redirect(add_query_arg('swjc_license_message', rawurlencode('Bez platné licence je nastavení pouze pro čtení.'), admin_url('admin.php?page=' . self::SLUG)));
+            exit;
+        }
+
         $payload = isset($_POST['swjc_payload']) ? wp_unslash($_POST['swjc_payload']) : '';
         $lists = json_decode($payload, true);
         if (!is_array($lists)) {
@@ -559,6 +728,10 @@ class SW_Jednoduche_Ceniky {
     }
 
     public function shortcode($atts = []) {
+        if (!$this->plugin_is_operational()) {
+            return '';
+        }
+
         $lists = $this->get_data();
         if (empty($lists)) {
             return '';
@@ -618,6 +791,210 @@ class SW_Jednoduche_Ceniky {
         echo '</div>';
         return ob_get_clean();
     }
+
+    private function get_license_panel_data(array $license, array $management, bool $is_operational): array {
+        $format_dt = static function(int $ts): string {
+            return $ts > 0 ? wp_date('j. n. Y H:i', $ts) : '—';
+        };
+        $format_date = static function(string $ymd): string {
+            if ($ymd === '') {
+                return '—';
+            }
+            $ts = strtotime($ymd . ' 12:00:00');
+            return $ts ? wp_date('j. n. Y', $ts) : $ymd;
+        };
+
+        $base = [
+            'badge_class' => 'inactive',
+            'badge_label' => 'Licence chybí',
+            'mode'        => 'Samostatná licence pluginu',
+            'subline'     => '',
+            'valid_to'    => '—',
+            'domain'      => '',
+            'last_check'  => '—',
+            'message'     => '',
+        ];
+
+        if ($management['guard_present']) {
+            if ($management['is_active']) {
+                return array_merge($base, [
+                    'badge_class' => 'active',
+                    'badge_label' => 'Platná licence',
+                    'mode'        => 'Správa webu',
+                    'valid_to'    => $format_date((string) get_option('swg_managed_until', '')),
+                    'domain'      => (string) get_option('swg_licence_domain', ''),
+                    'last_check'  => $format_dt((int) $management['guard_last_success']),
+                ]);
+            }
+            if ($management['management_status'] !== 'NONE') {
+                return array_merge($base, [
+                    'badge_class' => 'inactive',
+                    'badge_label' => 'Licence neplatná',
+                    'mode'        => 'Správa webu',
+                    'subline'     => 'Správa webu je po expiraci nebo omezená. Ceníky se na webu nevypisují.',
+                    'valid_to'    => $format_date((string) get_option('swg_managed_until', '')),
+                    'domain'      => (string) get_option('swg_licence_domain', ''),
+                    'last_check'  => $format_dt((int) $management['guard_last_success']),
+                    'message'     => 'Po expiraci lze plugin deaktivovat nebo smazat.',
+                ]);
+            }
+        }
+
+        if ($license['status'] === 'active') {
+            return array_merge($base, [
+                'badge_class' => 'active',
+                'badge_label' => 'Platná licence',
+                'mode'        => 'Samostatná licence pluginu',
+                'subline'     => $license['key'] !== '' ? 'Licenční kód: ' . $license['key'] : '',
+                'valid_to'    => $format_date((string) $license['valid_to']),
+                'domain'      => (string) $license['domain'],
+                'last_check'  => $format_dt((int) $license['last_success']),
+                'message'     => $license['message'] !== '' ? $license['message'] : 'Plugin běží přes samostatnou licenci.',
+            ]);
+        }
+
+        return array_merge($base, [
+            'badge_class' => $is_operational ? 'active' : 'inactive',
+            'badge_label' => $is_operational ? 'Platná licence' : 'Licence chybí',
+            'mode'        => 'Samostatná licence pluginu',
+            'subline'     => $license['key'] !== '' ? 'Licenční kód: ' . $license['key'] : 'Zatím nebyl uložen žádný licenční kód.',
+            'valid_to'    => $format_date((string) $license['valid_to']),
+            'domain'      => (string) $license['domain'],
+            'last_check'  => $format_dt((int) $license['last_check']),
+            'message'     => $license['message'] !== '' ? $license['message'] : 'Bez platné licence plugin shortcode nic nevypisuje.',
+        ]);
+    }
+
+    public function maybe_refresh_plugin_license() {
+        $management = $this->get_management_context();
+        if ($management['is_active']) {
+            return;
+        }
+
+        $license = $this->get_license_state();
+        if ($license['key'] === '' || !current_user_can('manage_options')) {
+            return;
+        }
+        if (!empty($_POST['license_key'])) {
+            return;
+        }
+        if ($license['last_check'] > 0 && (time() - (int) $license['last_check']) < (12 * HOUR_IN_SECONDS)) {
+            return;
+        }
+
+        $this->refresh_plugin_license('admin-auto');
+    }
+
+    private function refresh_plugin_license(string $reason = 'manual', string $override_key = ''): array {
+        $key = $override_key !== '' ? sanitize_text_field($override_key) : (string) $this->get_license_state()['key'];
+        if ($key === '') {
+            $this->update_license_state([
+                'key' => '',
+                'status' => 'missing',
+                'type' => '',
+                'valid_to' => '',
+                'domain' => '',
+                'message' => 'Licenční kód zatím není uložený.',
+                'last_check' => time(),
+            ]);
+            return ['ok' => false, 'error' => 'missing_key'];
+        }
+
+        $site_id = (string) get_option('swg_site_id', '');
+        $payload = [
+            'license_key' => $key,
+            'plugin_slug' => self::PLUGIN_SLUG,
+            'site_id' => $site_id,
+            'site_url' => home_url('/'),
+            'reason' => $reason,
+            'plugin_version' => $this->get_plugin_version(),
+        ];
+
+        $res = wp_remote_post(rtrim(self::HUB_BASE, '/') . '/wp-json/swlic/v2/plugin-license', [
+            'timeout' => 20,
+            'headers' => ['Content-Type' => 'application/json'],
+            'body' => wp_json_encode($payload, JSON_UNESCAPED_SLASHES),
+        ]);
+
+        if (is_wp_error($res)) {
+            $this->update_license_state([
+                'key' => $key,
+                'status' => 'error',
+                'message' => $res->get_error_message(),
+                'last_check' => time(),
+            ]);
+            return ['ok' => false, 'error' => $res->get_error_message()];
+        }
+
+        $code = (int) wp_remote_retrieve_response_code($res);
+        $body = (string) wp_remote_retrieve_body($res);
+        $data = json_decode($body, true);
+        if ($code < 200 || $code >= 300 || !is_array($data)) {
+            $api_message = 'Nepodařilo se ověřit licenci.';
+            if (is_array($data) && !empty($data['message'])) {
+                $api_message = sanitize_text_field((string) $data['message']);
+            } elseif ($code > 0) {
+                $api_message = 'Hub vrátil neočekávanou odpověď (HTTP ' . $code . ').';
+            }
+
+            $this->update_license_state([
+                'key' => $key,
+                'status' => 'error',
+                'message' => $api_message,
+                'last_check' => time(),
+            ]);
+            return ['ok' => false, 'error' => 'bad_response', 'message' => $api_message, 'http_code' => $code];
+        }
+
+        $this->update_license_state([
+            'key' => $key,
+            'status' => sanitize_key((string) ($data['status'] ?? 'missing')),
+            'type' => sanitize_key((string) ($data['licence_type'] ?? 'plugin_single')),
+            'valid_to' => sanitize_text_field((string) ($data['valid_to'] ?? '')),
+            'domain' => sanitize_text_field((string) ($data['assigned_domain'] ?? '')),
+            'message' => sanitize_text_field((string) ($data['message'] ?? '')),
+            'last_check' => time(),
+            'last_success' => !empty($data['ok']) ? time() : 0,
+        ]);
+
+        return $data;
+    }
+
+    public function handle_verify_license() {
+        if (!current_user_can('manage_options')) {
+            wp_die('Zakázáno.', 'Zakázáno', ['response' => 403]);
+        }
+        check_admin_referer('swjc_verify_license');
+        $key = sanitize_text_field((string) ($_POST['license_key'] ?? ''));
+        $result = $this->refresh_plugin_license('manual', $key);
+        $message = !empty($result['message']) ? (string) $result['message'] : (!empty($result['ok']) ? 'Licence byla ověřena.' : 'Licenci se nepodařilo ověřit.');
+        wp_safe_redirect(add_query_arg('swjc_license_message', rawurlencode($message), admin_url('admin.php?page=' . self::SLUG)));
+        exit;
+    }
+
+    public function handle_remove_license() {
+        if (!current_user_can('manage_options')) {
+            wp_die('Zakázáno.', 'Zakázáno', ['response' => 403]);
+        }
+        check_admin_referer('swjc_remove_license');
+        delete_option(self::LICENSE_OPTION);
+        wp_safe_redirect(add_query_arg('swjc_license_message', rawurlencode('Licenční kód byl odebrán.'), admin_url('admin.php?page=' . self::SLUG)));
+        exit;
+    }
+
+    public function block_direct_deactivate() {
+        $management = $this->get_management_context();
+        if (!$management['is_active']) {
+            return;
+        }
+
+        $action = isset($_GET['action']) ? sanitize_key((string) $_GET['action']) : '';
+        $plugin = isset($_GET['plugin']) ? sanitize_text_field((string) $_GET['plugin']) : '';
+        if ($action === 'deactivate' && $plugin === plugin_basename(__FILE__)) {
+            wp_die('Tento plugin nelze deaktivovat při aktivní správě webu.', 'Chráněný plugin', ['response' => 403]);
+        }
+    }
+
 }
 
 new SW_Jednoduche_Ceniky();
