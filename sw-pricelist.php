@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Jednoduché ceníky
  * Description: Jednoduchý tvůrce více ceníků se shortcode pro výpis kategorií a položek.
- * Version: 1.0
+ * Version: 1.1
  * Author: Smart Websites
  * Author URI: https://smart-websites.cz
  * Update URI: https://github.com/paveltravnicek/sw-pricelist/
@@ -35,7 +35,7 @@ final class SW_Jednoduche_Ceniky {
     const SLUG       = 'sw-jednoduche-ceniky';
     const LICENSE_OPTION = 'swjc_license';
     const LICENSE_CRON_HOOK = 'swjc_license_daily_check';
-    const HUB_BASE = 'https://smart-websites.cz';
+    const HUB_BASE = 'https://agent.smart-websites.cz';
     const PLUGIN_SLUG = 'sw-pricelist';
 
     public function __construct() {
@@ -910,7 +910,7 @@ final class SW_Jednoduche_Ceniky {
             'plugin_version' => $this->get_plugin_version(),
         ];
 
-        $res = wp_remote_post(rtrim(self::HUB_BASE, '/') . '/wp-json/swlic/v2/plugin-license', [
+        $res = wp_remote_post(rtrim(self::HUB_BASE, '/') . '/index.php?api=swlic/v2/plugin-license', [
             'timeout' => 20,
             'headers' => ['Content-Type' => 'application/json'],
             'body' => wp_json_encode($payload, JSON_UNESCAPED_SLASHES),
