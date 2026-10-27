@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Jednoduché ceníky
- * Description: Jednoduchý tvůrce více ceníků se shortcode pro výpis kategorií a položek.
- * Version: 1.1
+ * Description: Jednoduchý tvůrce více ceníků se shortcode pro výpis kategorií a položek. Při uložení se čistí cache stránek (WP Compress, volitelně Varnish).
+ * Version: 1.2
  * Author: Smart Websites
  * Author URI: https://smart-websites.cz
  * Update URI: https://github.com/paveltravnicek/sw-pricelist/
@@ -37,6 +37,7 @@ final class SW_Jednoduche_Ceniky {
     const LICENSE_CRON_HOOK = 'swjc_license_daily_check';
     const HUB_BASE = 'https://agent.smart-websites.cz';
     const PLUGIN_SLUG = 'sw-pricelist';
+    const OPTION_PURGE_VARNISH = 'swjc_purge_varnish';
 
     public function __construct() {
         register_activation_hook(__FILE__, [$this, 'activate']);
@@ -406,6 +407,13 @@ final class SW_Jednoduche_Ceniky {
                     <?php endforeach; ?>
                 </div>
 
+                <div class="swjc-card">
+                    <label>
+                        <input type="checkbox" name="swjc_purge_varnish" value="1" <?php checked(get_option(self::OPTION_PURGE_VARNISH, '0'), '1'); ?>>
+                        <?php echo esc_html__('Při uložení mazat i Varnish cache (zapnout jen na hostingu s Varnishem). Cache WP Compressu se maže vždy.', 'sw-jednoduche-ceniky'); ?>
+                    </label>
+                </div>
+
                 <textarea name="swjc_payload" id="swjc-payload" class="swjc-hidden"></textarea>
                 </fieldset>
             </form>
@@ -590,6 +598,10 @@ final class SW_Jednoduche_Ceniky {
 
         $sanitized = $this->sanitize_payload($lists);
         update_option(self::OPTION_KEY, $sanitized, false);
+        update_option(self::OPTION_PURGE_VARNISH, !empty($_POST['swjc_purge_varnish']) ? '1' : '0', false);
+
+        // Nové ceny se mají projevit hned – vyčistit cache stránek s ceníkem.
+        $this->purge_page_caches();
 
         wp_safe_redirect(add_query_arg(['page' => self::SLUG, 'updated' => '1'], admin_url('admin.php')));
         exit;
@@ -993,6 +1005,105 @@ final class SW_Jednoduche_Ceniky {
         if ($action === 'deactivate' && $plugin === plugin_basename(__FILE__)) {
             wp_die('Tento plugin nelze deaktivovat při aktivní správě webu.', 'Chráněný plugin', ['response' => 403]);
         }
+    }
+
+    /* ------------------------------------------------------------------
+     * PURGE CACHE (WP Compress vždy, Varnish jen pokud je zapnutý v nastavení)
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Publikované stránky se shortcodem pluginu (+ homepage).
+     */
+    private function cache_purge_post_ids() {
+        global $wpdb;
+        $ids = $wpdb->get_col(
+            "SELECT ID FROM {$wpdb->posts}
+             WHERE post_status = 'publish'
+               AND post_type NOT IN ('revision','nav_menu_item')
+               AND post_content LIKE '%[%cenik%'"
+        );
+        $front = (int) get_option( 'page_on_front' );
+        if ( $front > 0 ) {
+            $ids[] = $front;
+        }
+        return array_values( array_unique( array_map( 'intval', $ids ) ) );
+    }
+
+    /**
+     * Vyčistí cache stránek se shortcodem. Bezpečné na každém webu:
+     * - WP Compress jen pokud je aktivní (hard purge = kopie se opravdu smaže, žádné servírování staré verze),
+     * - Varnish jen pokud je v nastavení zapnutý (HTTP PURGE na konkrétní URL, timeout 1 s),
+     * - jakákoli chyba purge nikdy neshodí uložení dat.
+     */
+    public function purge_page_caches() {
+        static $done = false; // max. 1× za request
+        if ( $done ) {
+            return;
+        }
+        $done = true;
+
+        try {
+            $post_ids = $this->cache_purge_post_ids();
+            foreach ( $post_ids as $pid ) {
+                clean_post_cache( $pid );
+            }
+
+            // WP Compress – save_post hooky mívá vypnuté, proto voláme jeho purge napřímo.
+            if ( defined( 'WPS_IC_DIR' ) ) {
+                $files = array(
+                    'wps_ic_cache_integrations' => 'classes/cache-integrations.class.php',
+                    'wps_ic_cache'              => 'classes/cache.class.php',
+                    'wps_ic_url_key'            => 'traits/url_key.php',
+                    'wps_cacheHtml'             => 'addons/cache/cacheHtml.php',
+                );
+                foreach ( $files as $class => $file ) {
+                    if ( ! class_exists( $class ) && file_exists( WPS_IC_DIR . $file ) ) {
+                        include_once WPS_IC_DIR . $file;
+                    }
+                }
+                if ( class_exists( 'wps_ic_cache' ) && is_callable( array( 'wps_ic_cache', 'removeHtmlCacheFiles' ) ) ) {
+                    foreach ( $post_ids as $pid ) {
+                        wps_ic_cache::removeHtmlCacheFiles( (int) $pid, '', '', 'hard' );
+                    }
+                    wps_ic_cache::removeHtmlCacheFiles( 'home', '', '', 'hard' );
+                }
+            }
+
+            // Další běžné cache pluginy (volá se jen to, co na webu je).
+            if ( function_exists( 'rocket_clean_domain' ) ) { rocket_clean_domain(); }
+            if ( function_exists( 'w3tc_flush_all' ) ) { w3tc_flush_all(); }
+            if ( function_exists( 'wp_cache_clear_cache' ) ) { wp_cache_clear_cache(); }
+            do_action( 'litespeed_purge_all' );
+
+            // Varnish – jen na webech, kde je zapnutý v nastavení pluginu.
+            if ( '1' === get_option( self::OPTION_PURGE_VARNISH, '0' ) ) {
+                $urls = array( home_url( '/' ) );
+                foreach ( $post_ids as $pid ) {
+                    $u = get_permalink( $pid );
+                    if ( $u ) {
+                        $urls[] = $u;
+                    }
+                }
+                $urls = array_unique( apply_filters( 'swjc_purge_urls', array_merge( $urls, $this->extra_purge_urls() ) ) );
+                foreach ( $urls as $url ) {
+                    wp_remote_request(
+                        $url,
+                        array(
+                            'method'   => 'PURGE',
+                            'timeout'  => 1,
+                            'blocking' => true,
+                            'headers'  => array( 'X-Purge-Method' => 'exact' ),
+                        )
+                    );
+                }
+            }
+        } catch ( \Throwable $e ) {
+            error_log( 'sw-pricelist: cache purge failed: ' . $e->getMessage() );
+        }
+    }
+
+    private function extra_purge_urls() {
+        return array();
     }
 
 }
